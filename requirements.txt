@@ -1,0 +1,7 @@
+pytesseract
+pdfplumber
+pandas
+sqlalchemy
+pymysql
+pillow
+pdf2image

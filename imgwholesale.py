@@ -1,90 +1,154 @@
-from PIL import Image, ImageEnhance, ImageFilter
+import pdfplumber
 import pytesseract
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import create_engine
-from sqlalchemy import Column, Integer, String, Float
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import create_engine, Column, Integer, Float, String
+from sqlalchemy.orm import declarative_base, sessionmaker
+import re
+import os
+from PIL import Image
 
+DATABASE_URL = "mysql+pymysql://root:@localhost/convertdata"
+engine = create_engine(DATABASE_URL)
 Base = declarative_base()
 
-class Product(Base):
+class ProductTable(Base):
     __tablename__ = 'invoice'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    product_no = Column(String(50))
+    description = Column(String(255))
+    quantity = Column(Integer)
+    unit_price = Column(Float)
+    line_total = Column(Float)
 
-    id = Column(Integer, primary_key=True)
-    product_no = Column(String, nullable=False)
-    description = Column(String, nullable=False)
-    quantity = Column(Integer, nullable=False)
-    unit_price = Column(Float, nullable=False)
-    line_total = Column(Float, nullable=False)
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+session = Session()
 
-def preprocess_image(img_path):
-    img = Image.open(img_path)
-    img = img.convert('L') 
-    img = img.filter(ImageFilter.SHARPEN) 
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2) 
-    return img
+def parse_value(value, value_type, default=None):
+    try:
+        if value is None or value.strip() == "":
+            return default
+        if value_type == int:
+            return int(value.replace(",", "").strip())
+        elif value_type == float:
+            return float(value.replace(",", "").strip())
+        elif value_type == str:
+            return value.strip()
+    except (ValueError, AttributeError):
+        return default
 
 def parse_row(row_text):
-    parts = row_text.strip().split()
-    if len(parts) < 5 or not parts[0].isdigit():
-        return None
     try:
+        row_text = re.sub(r"[|[/~_}{)()(=]", " ", row_text)
+        row_text = re.sub(r"\s+", " ", row_text).strip()
+        parts = row_text.split()
+
+        if len(parts) < 6:
+            return None
+
         product_no = parts[0]
 
-     
-        line_total = parts[-1]
+        # Baris produk di invoice terdiri dari:
+        # Product No | Description (bisa multi kata) | Quantity | Unit Price | Line Total
+        try:
+            quantity = int(parts[-3])
+            unit_price = float(parts[-2])
+            line_total = float(parts[-1])
+            description = " ".join(parts[1:-3])
+        except ValueError:
+            return None
 
-      
-        unit_price = parts[-2]
-        quantity = parts[-3]
-
-        description = " ".join(parts[1:-3])
-
-        return (product_no, description, quantity, unit_price, line_total)
+        return (product_no, description, str(quantity), str(unit_price), str(line_total))
     except Exception as e:
-        print(f"Failed to parse row: {row_text}. Error: {e}")
+        print(f"Kesalahan parsing baris: {row_text}. Error: {e}")
         return None
-
-def process_invoice(img_path, db_url):
-    img = preprocess_image(img_path)
-
-    text = pytesseract.image_to_string(img)
-
-    print("--- OCR Output ---")
-    print(text)
-
-    engine = create_engine(db_url)
-    Session = sessionmaker(bind=engine)
-    session = Session()
-
-    rows = text.split('\n')
-    for row in rows:
-        parsed_data = parse_row(row)
-        if parsed_data:
-            product_no, description, quantity, unit_price, line_total = parsed_data
-            try:
-                product = Product(
-                    product_no=product_no,
-                    description=description,
-                    quantity=quantity,
-                    unit_price=unit_price,
-                    line_total=line_total
-                )
-                session.add(product) 
-
-            except Exception as e:
-                print(f"Error: {e}")
-                session.rollback()  
-
+def extract_text_from_image(image_path):
     try:
-        session.commit()  
-        print("Invoice processed and data saved successfully.")
+        pil_image = Image.open(image_path)
+        config = "--psm 6"
+        return pytesseract.image_to_string(pil_image, config=config)
     except Exception as e:
-        print(f"Error committing data: {e}")
-        session.rollback()
+        print(f"Kesalahan OCR pada gambar: {e}")
+        return ""
 
-img_path = "pdf/wholesale-produce-distributor-invoice.webp"
-db_url = "mysql+pymysql://root:@localhost:3306/convertdata" 
+def extract_text_with_ocr(page):
+    try:
+        page_image = page.to_image()
+        pil_image = page_image.original
+        config = "--psm 6"
+        return pytesseract.image_to_string(pil_image, config=config)
+    except Exception as e:
+        print(f"Kesalahan OCR: {e}")
+        return ""
 
-process_invoice(img_path, db_url)
+def extract_table_from_pdf(pdf_path):
+
+    if not os.path.exists(pdf_path):
+        print(f"File tidak ditemukan: {pdf_path}")
+        return
+
+    if pdf_path.endswith('.pdf'):
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                text = page.extract_text()
+
+                if not text:
+                    print(f"Halaman {page_number} menggunakan OCR karena tidak ada teks.")
+                    text = extract_text_with_ocr(page)
+                if not text:
+                    print(f"Tidak ada teks di halaman {page_number}.")
+                    continue
+
+                rows = text.split("\n")
+                process_row(rows)
+
+    elif pdf_path.endswith(('.png','.jpg','.jpeg','.webp')):
+        print(f"File berformat gambar : {pdf_path}")
+        text = extract_text_from_image(pdf_path)
+
+        if not text:
+            print(f"TIdak ada teks yang diekstrak dari gambar {pdf_path}")
+            return
+        
+        rows = text.split("\n")
+        print(f" input {rows}")
+        process_row(rows)
+
+    else:
+        print(f"format file tidak didukung: {pdf_path}")
+
+def process_row(rows):
+            
+    for row in rows:
+        parsed_row = parse_row(row)
+        print(f"Parsed row: {parsed_row}")
+
+        if not parsed_row:
+            print(f"Baris tidak valid: {row}")
+            continue
+                    
+        try:
+            product_no, description, quantity, unit_price, line_total = parsed_row
+         
+            if not all([product_no, description, quantity, unit_price, line_total]):
+                print(f"Data tidak lengkap: {row}")
+                continue
+
+            if not (product_no.isdigit() and len(product_no) == 5):
+                print(f"Nomor produk tidak valid: {product_no}")
+                continue
+
+            product = ProductTable(
+                        product_no=parse_value(product_no, str),
+                        description=parse_value(description, str),
+                        quantity=parse_value(quantity, int),
+                        unit_price=parse_value(unit_price, float),
+                        line_total=parse_value(line_total, float),
+                    )
+            session.add(product)
+            session.commit()
+        except Exception as e:
+            print(f"Kesalahan saat menyimpan ke database: {e}")
+            session.rollback()
+            continue
+
+extract_table_from_pdf("pdf/wholesale-produce-distributor-invoice.webp")

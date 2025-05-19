@@ -16,6 +16,7 @@ DB_HOST = 'localhost'
 DB_USER = 'root'
 DB_PASSWORD = ''
 DB_NAME = 'convertdata'
+TABLE_NAME = 'invoice'
 
 # ===== Step 1: Convert PDF ke text =====
 def pdf_to_text(pdf_path):
@@ -33,20 +34,23 @@ def pdf_to_text(pdf_path):
 # ===== Step 2: Parsing text ke rows =====
 def parse_text_to_rows(text):
     rows = []
+    header = None
     for line in text.strip().split('\n'):
         line = line.strip()
         if not line:
             continue
-        columns = [col.strip() for col in line.split('  ') if col.strip()]
-        if len(columns) >= 5:
-            rows.append(columns[:5])
-    return rows
+        columns = [col.strip() for col in line.split(' ') if col.strip()]
+        if not header:
+            header = columns
+        else:
+            rows.append(columns)
+    return header, rows
 
 # ===== Step 3: Simpan CSV =====
-def save_rows_to_csv(rows, csv_file):
+def save_rows_to_csv(header, rows, csv_file):
     with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['Product', 'Description', 'Quantity', 'Unit Price', 'Line Total'])
+        writer.writerow(header)
         writer.writerows(rows)
 
 # ===== Step 4: Masukkan CSV ke MySQL =====
@@ -58,29 +62,22 @@ def insert_csv_to_mysql(csv_file):
         database=DB_NAME
     )
     cur = conn.cursor()
-
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS invoice (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            product TEXT,
-            description TEXT,
-            quantity TEXT,
-            unit_price TEXT,
-            line_total TEXT
-        )
-    ''')
-
+    
+    # Create table
     with open(csv_file, newline='', encoding='utf-8') as f:
         reader = csv.reader(f)
-        next(reader, None)  # skip header
+        header = next(reader, None)
+        create_table_query = f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} ("
+        for col in header:
+            create_table_query += f"{col} TEXT, "
+        create_table_query = create_table_query[:-2] + ")"
+        cur.execute(create_table_query)
+        
+        # Insert data
+        insert_query = f"INSERT INTO {TABLE_NAME} ({', '.join(header)}) VALUES ({', '.join(['%s'] * len(header))})"
         for row in reader:
-            if len(row) < 5:
-                row += [''] * (5 - len(row))
-            cur.execute('''
-                INSERT INTO invoice (product, description, quantity, unit_price, line_total)
-                VALUES (%s, %s, %s, %s, %s)
-            ''', row[:5])
-
+            cur.execute(insert_query, row)
+    
     conn.commit()
     cur.close()
     conn.close()
@@ -88,23 +85,22 @@ def insert_csv_to_mysql(csv_file):
 # ===== Main Entry Point =====
 def main(filename):
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
     if not filename.lower().endswith('.pdf'):
         print("❌ File bukan PDF")
         return
-
+    
     pdf_path = os.path.join(PDF_FOLDER, filename)
     if not os.path.exists(pdf_path):
         print(f"❌ File {pdf_path} tidak ditemukan.")
         return
-
+    
     print(f"🔍 Memproses {filename}...")
     text = pdf_to_text(pdf_path)
-    rows = parse_text_to_rows(text)
-
+    header, rows = parse_text_to_rows(text)
     output_csv = os.path.join(OUTPUT_FOLDER, filename.replace('.pdf', '.csv'))
-    save_rows_to_csv(rows, output_csv)
+    save_rows_to_csv(header, rows, output_csv)
     print(f"✅ Berhasil disimpan ke: {output_csv}")
+    insert_csv_to_mysql(output_csv)
 
 # ===== Saat dipanggil langsung =====
 if __name__ == '__main__':
